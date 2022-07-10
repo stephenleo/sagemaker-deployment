@@ -14,7 +14,6 @@ import boto3
 import sagemaker
 import sagemaker.session
 
-from sagemaker.estimator import Estimator
 from sagemaker.sklearn.estimator import SKLearn
 from sagemaker.inputs import TrainingInput
 from sagemaker.model_metrics import (
@@ -23,30 +22,34 @@ from sagemaker.model_metrics import (
 )
 from sagemaker.processing import (
     ProcessingInput,
-    ProcessingOutput,
-    ScriptProcessor,
+    ProcessingOutput
 )
+from sagemaker.sklearn.model import SKLearnModel
 from sagemaker.sklearn.processing import SKLearnProcessor
+from sagemaker.tuner import (
+    HyperparameterTuner, 
+    IntegerParameter, 
+    ContinuousParameter, 
+    CategoricalParameter
+)
+
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.condition_step import (
-    ConditionStep,
-)
-from sagemaker.workflow.functions import (
-    JsonGet,
-)
+from sagemaker.workflow.condition_step import ConditionStep
+from sagemaker.workflow.functions import JsonGet
 from sagemaker.workflow.parameters import (
     ParameterInteger,
     ParameterString,
 )
 from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import (
     ProcessingStep,
-    TrainingStep,
+    TuningStep,
+    CacheConfig,
 )
 from sagemaker.workflow.model_step import ModelStep
-from sagemaker.workflow.pipeline_context import PipelineSession
-from sagemaker.sklearn.model import SKLearnModel
+
 
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -131,7 +134,7 @@ def get_pipeline(
     processing_instance_type="ml.m5.xlarge",
     training_instance_type="ml.m5.xlarge",
 ):
-    """Gets a SageMaker ML Pipeline instance working with on heartdisease data.
+    """Gets a SageMaker ML Pipeline instance working on heartdisease data.
 
     Args:
         region: AWS region to create and run the pipeline.
@@ -141,21 +144,28 @@ def get_pipeline(
     Returns:
         an instance of a pipeline
     """
+    # Session information
     sagemaker_session = get_session(region, default_bucket)
     if role is None:
         role = sagemaker.session.get_execution_role(sagemaker_session)
-
     pipeline_session = get_pipeline_session(region, default_bucket)
 
-    # parameters for pipeline execution
-    processing_instance_count = ParameterInteger(name="ProcessingInstanceCount", default_value=1)
+    # Parameters for pipeline execution
+    processing_instance_count = ParameterInteger(
+        name="ProcessingInstanceCount", 
+        default_value=1
+    )
     model_approval_status = ParameterString(
-        name="ModelApprovalStatus", default_value="PendingManualApproval"
+        name="ModelApprovalStatus", 
+        default_value="PendingManualApproval"
     )
     input_data = ParameterString(
         name="InputDataUrl",
         default_value="https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data",
     )
+    
+    # Cache Pipeline steps to reduce execution time on subsequent executions
+    cache_config = CacheConfig(enable_caching=True, expire_after="30d")
 
     # Step 1: Processing step
     ## Create the processor
@@ -179,6 +189,7 @@ def get_pipeline(
         ],
         code=os.path.join(BASE_DIR, "preprocess.py"),
         job_arguments=["--input_data", input_data],
+        cache_config=cache_config
     )
 
     # Step 2: Model training step   
@@ -187,21 +198,38 @@ def get_pipeline(
         base_job_name=f"{base_job_prefix}/heartdisease-train",
         framework_version="1.0-1",
         entry_point=os.path.join(BASE_DIR, "train.py"),
-        hyperparameters={
-            "n_estimators": 50,
-            "min_samples_split": 0.05,
-            "criterion": "gini"
-        },
         instance_count=1,
         instance_type=training_instance_type,
         sagemaker_session=pipeline_session,
         role=role
     )
+    
+    # Define exploration boundaries
+    hyperparameter_ranges = {
+        "n_estimators": IntegerParameter(1, 20),
+        "min_samples_split": ContinuousParameter(0.01, 0.5),
+        "criterion": CategoricalParameter(["gini", "entropy"])
+    }
+
+    # Create optimizer
+    optimizer = HyperparameterTuner(
+        base_tuning_job_name="rfc-pipeline-tuner",
+        estimator=sklearn_estimator,
+        hyperparameter_ranges=hyperparameter_ranges,
+        objective_type="Maximize",
+        objective_metric_name="test-accuracy",
+        metric_definitions=[
+            {"Name": "train-accuracy", "Regex": "Training Accuracy: ([0-9.]+).*$"},
+            {"Name": "test-accuracy", "Regex": "Testing Accuracy: ([0-9.]+).*$"}
+        ],
+        max_jobs=10,
+        max_parallel_jobs=2,
+    )
 
     ## Create the pipeline step
-    step_train = TrainingStep(
-        name="TrainHeartDiseaseModel",
-        estimator=sklearn_estimator,
+    step_train = TuningStep(
+        name = "TrainHeartDiseaseModelTuning",
+        tuner = optimizer,
         inputs={
             "train": TrainingInput(
                 s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
@@ -215,10 +243,12 @@ def get_pipeline(
                 ].S3Output.S3Uri,
                 content_type="text/csv",
             ),
-        }
+        },
+        cache_config=cache_config
     )
 
     # Step 3: Model evaluation step
+    ## Create the processor
     sklearn_processor = SKLearnProcessor(
         framework_version="1.0-1",
         instance_type=processing_instance_type,
@@ -240,7 +270,7 @@ def get_pipeline(
         processor=sklearn_processor,
         inputs=[
             ProcessingInput(
-                source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+                source=step_train.get_top_model_s3_uri(top_k=0, s3_bucket=default_bucket),
                 destination="/opt/ml/processing/model",
             ),
             ProcessingInput(
@@ -260,8 +290,9 @@ def get_pipeline(
         property_files=[evaluation_report]
     )    
     
-    # register model step that will be conditionally executed
+    # Step 4: Register model step that will be conditionally executed
     s3_uri = step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+    
     model_metrics = ModelMetrics(
         model_statistics=MetricsSource(
             s3_uri=f'{s3_uri}/evaluation.json',
@@ -272,20 +303,21 @@ def get_pipeline(
     model = SKLearnModel(
         framework_version="1.0-1",
         entry_point=os.path.join(BASE_DIR, "serve.py"),
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        model_data=step_train.get_top_model_s3_uri(top_k=0, s3_bucket=default_bucket),
         sagemaker_session=pipeline_session,
         role=role,
     )
     
     step_args = model.register(
-        content_types=["text/csv"],
-        response_types=["text/csv"],
-        inference_instances=["ml.t2.medium", "ml.m5.large"],
+        content_types=["application/json"],
+        response_types=["application/json"],
+        inference_instances=["ml.t2.medium"],
         transform_instances=["ml.m5.large"],
         model_package_group_name=model_package_group_name,
         approval_status=model_approval_status,
-        model_metrics=model_metrics,
+        model_metrics=model_metrics
     )
+    
     step_register = ModelStep(
         name="RegisterHeartDiseaseModel",
         step_args=step_args,
@@ -300,6 +332,7 @@ def get_pipeline(
         ),
         right=0.80,
     )
+    
     step_cond = ConditionStep(
         name="HeartDiseaseAccuracyCheck",
         conditions=[cond_gte],
@@ -307,7 +340,7 @@ def get_pipeline(
         else_steps=[],
     )
 
-    # pipeline instance
+    # Step 5: Create the entire pipeline
     pipeline = Pipeline(
         name=pipeline_name,
         parameters=[
@@ -320,4 +353,5 @@ def get_pipeline(
         steps=[step_process, step_train, step_eval, step_cond],
         sagemaker_session=pipeline_session,
     )
+    
     return pipeline

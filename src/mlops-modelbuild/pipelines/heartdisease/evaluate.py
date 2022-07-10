@@ -27,10 +27,7 @@ if __name__ == "__main__":
     test_df = pd.read_csv(test_path)
 
     X_test = test_df.drop("target", axis=1)
-    y_test = test_df["target"]
-
-    logger.info("Calculating metrics")   
-    
+    y_test = test_df["target"]   
     
     logger.info("Writing out metrics")
     output_dir = "/opt/ml/processing/evaluation"
