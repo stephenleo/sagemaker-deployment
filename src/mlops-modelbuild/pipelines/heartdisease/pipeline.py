@@ -249,7 +249,7 @@ def get_pipeline(
 
     # Step 3: Model evaluation step
     ## Create the processor
-    sklearn_processor = SKLearnProcessor(
+    sklearn_evaluator = SKLearnProcessor(
         framework_version="1.0-1",
         instance_type=processing_instance_type,
         instance_count=1,
@@ -267,7 +267,7 @@ def get_pipeline(
     
     step_eval = ProcessingStep(
         name="EvaluateHeartDiseaseModel",
-        processor=sklearn_processor,
+        processor=sklearn_evaluator,
         inputs=[
             ProcessingInput(
                 source=step_train.get_top_model_s3_uri(top_k=0, s3_bucket=default_bucket),
