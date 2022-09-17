@@ -49,7 +49,7 @@ Click on “Studio”. **DO NOT CLICK ON CANVAS ($$$)!!!!**
 
 1. After some loading, your brand new jupyter lab interface running on Sagemaker studio servers will open up. If the loading gets stuck on a white screen, try refreshing the page.
     - You can clone any github repository. For example, leo’s sagemaker course repository: https://github.com/stephenleo/sagemaker-deployment.git
-    - Follow the lessons in the notebooks/ directory if you’re interested.
+    - Follow the lessons in the `notebooks/` directory.
 
     <img src="images/9.png" width="1000">
     
